@@ -1,0 +1,91 @@
+# GitHub Action - SonarQube Scan com Shard Router
+# Este workflow:
+# 1. Le o sonar-project.properties para extrair projectKey e tag
+# 2. Consulta o Router API para descobrir qual shard usar
+# 3. Executa o sonar-scanner apontando para o shard correto
+name: SonarQube Shard Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ROUTER_API_URL: https://jtf0v97sdh.execute-api.us-east-1.amazonaws.com
+  SONAR_SCANNER_VERSION: 6.2.1.4610
+
+jobs:
+  sonar-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 1: Extrair projectKey e tag do sonar-project.properties
+      - name: Extract SonarQube config
+        id: sonar-config
+        run: |
+          PROJECT_KEY=$(grep "sonar.projectKey=" sonar-project.properties | cut -d'=' -f2)
+          PROJECT_TAGS=$(grep "sonar.projectTags=" sonar-project.properties | cut -d'=' -f2)
+          PRIMARY_TAG=$(echo $PROJECT_TAGS | cut -d',' -f1)
+          echo "project_key=$PROJECT_KEY" >> $GITHUB_OUTPUT
+          echo "primary_tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
+          echo "::notice::Project: $PROJECT_KEY | Tag: $PRIMARY_TAG"
+
+      # Step 2: Consultar Router para resolver o shard
+      - name: Resolve Shard via Router
+        id: resolve-shard
+        run: |
+          echo "Consultando Router API..."
+          RESPONSE=$(curl -s "${{ env.ROUTER_API_URL }}/resolve?projectKey=${{ steps.sonar-config.outputs.project_key }}&tag=${{ steps.sonar-config.outputs.primary_tag }}")
+          
+          SONAR_URL=$(echo $RESPONSE | jq -r '.url')
+          SHARD_ID=$(echo $RESPONSE | jq -r '.shard_id')
+          METHOD=$(echo $RESPONSE | jq -r '.method')
+          
+          echo "sonar_url=$SONAR_URL" >> $GITHUB_OUTPUT
+          echo "shard_id=$SHARD_ID" >> $GITHUB_OUTPUT
+          echo "::notice::Resolved: $SHARD_ID ($METHOD) -> $SONAR_URL"
+
+      # Step 3: Instalar SonarScanner
+      - name: Install SonarScanner
+        run: |
+          curl -sLO "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux-x64.zip"
+          unzip -q sonar-scanner-cli-${{ env.SONAR_SCANNER_VERSION }}-linux-x64.zip
+          echo "$PWD/sonar-scanner-${{ env.SONAR_SCANNER_VERSION }}-linux-x64/bin" >> $GITHUB_PATH
+
+      # Step 4: Executar scan no shard correto
+      - name: Run SonarQube Scan
+        run: |
+          echo "Scanning on shard: ${{ steps.resolve-shard.outputs.shard_id }}"
+          echo "SonarQube URL: ${{ steps.resolve-shard.outputs.sonar_url }}"
+          
+          sonar-scanner \
+            -Dsonar.host.url=${{ steps.resolve-shard.outputs.sonar_url }} \
+            -Dsonar.login=admin \
+            -Dsonar.password=Laurence-123
+
+      # Step 5: Verificar Quality Gate
+      - name: Check Quality Gate
+        run: |
+          echo "Verificando Quality Gate..."
+          SONAR_URL="${{ steps.resolve-shard.outputs.sonar_url }}"
+          PROJECT_KEY="${{ steps.sonar-config.outputs.project_key }}"
+          
+          # Aguardar processamento (max 60s)
+          for i in $(seq 1 12); do
+            sleep 5
+            STATUS=$(curl -s -u admin:Laurence-123 \
+              "$SONAR_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY" \
+              | jq -r '.projectStatus.status')
+            
+            if [ "$STATUS" = "OK" ]; then
+              echo "::notice::Quality Gate PASSED"
+              exit 0
+            elif [ "$STATUS" = "ERROR" ]; then
+              echo "::error::Quality Gate FAILED - merge bloqueado!"
+              exit 1
+            fi
+          done
+          echo "::warning::Quality Gate status indeterminate"
